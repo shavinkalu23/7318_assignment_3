@@ -11,6 +11,7 @@ import datetime
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
 import pandas_ta as ta
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import seaborn as sns
@@ -18,13 +19,21 @@ from sklearn.model_selection import train_test_split
 import pandas as pd
 import torch.nn as nn
 from sklearn.metrics import mean_squared_error
-from hyperopt import STATUS_OK, hp, fmin, tpe, Trials
+from hyperopt import STATUS_OK,STATUS_FAIL, hp, fmin, tpe, Trials
+import numpy as np
+from statsmodels.tsa.seasonal import seasonal_decompose
+# set seed for reproducability
+
+seed = 1234
+
+np.random.seed(seed) 
+torch.manual_seed(seed)
 # Define the ticker symbol for S&P 500
 ticker_symbol = "^GSPC"
 
 # Define the date range: current date and 3 years ago
 end_date = datetime.date.today()
-start_date = end_date - datetime.timedelta(days=10*365)
+start_date = end_date - datetime.timedelta(days=20*365)
 
 # Use yfinance to download the stock sp500_data
 sp500_data = yf.download(ticker_symbol, start=start_date, end=end_date)
@@ -35,6 +44,17 @@ print(sp500_data.head())
 sp500_data.describe()
 sp500_data.info()
 
+
+# Seasonal decomposition of closing prices
+closing_prices = sp500_data['Close']
+decomposition = seasonal_decompose(closing_prices, model='multiplicative', period=252)  # Assuming 252 trading days in a year
+
+
+# Plot the seasonal decomposition
+plt.rcParams.update({'figure.figsize': (10,10)})
+decomposition.plot()
+plt.show()
+
 # Technical Indicators
 sp500_data['RSI'] = sp500_data.ta.rsi()
 sp500_data['SMA'] = sp500_data.ta.sma(close='Close', length=20)
@@ -43,13 +63,14 @@ sp500_data['MACD'] = sp500_data.ta.macd(close='Close')['MACD_12_26_9']
 sp500_data['ATR'] = sp500_data.ta.atr()
 sp500_data['Stoch'] = sp500_data.ta.stoch()[['STOCHk_14_3_3']]
 # Calculate the daily price change ratio (in percentage)
-sp500_data['PCR'] = sp500_data['Close'].pct_change()*100
+
+sp500_data['PCR'] = np.log(sp500_data['Close']).pct_change()*100
 # Drop NaN values
 sp500_data.dropna(inplace=True)
 
 # Selecting features to normalize
-features = ['RSI', 'SMA', 'EMA', 'MACD', 'ATR', 'Stoch', 'PCR' ]
-# features = ['Close' ]
+features = ['RSI', 'SMA', 'EMA', 'MACD', 'ATR', 'Stoch', 'PCR' , 'Close']
+features = ['PCR' ]
 target_column = 'PCR'  # The column you are predicting
 
 # Initialize a scaler
@@ -68,7 +89,8 @@ plt.figure(figsize=(10, 8))
 sns.heatmap(corr_matrix, annot=True, cmap='coolwarm')
 plt.show()
 
-
+# Selecting features to normalize
+features = ['RSI', 'MACD', 'ATR', 'Stoch', 'PCR' , 'Close']
 #The closing price is the last price at which the stock is traded during the regular trading day.
 # A stock’s closing price is the standard benchmark used by investors to track its performance over time.
 # Plotting
@@ -130,7 +152,7 @@ class StockDataset(Dataset):
         label = self.labels[idx]
         return torch.tensor(sequence.values).float(), torch.tensor(label).float()
 # Prepare the sequences
-sequence_length = 50  # sequence length
+sequence_length = 60  # sequence length
 train_seq, train_labels = create_sequences(scaled_train, target_column, sequence_length)
 val_seq, val_labels = create_sequences(scaled_val, target_column, sequence_length)
 test_seq, test_labels = create_sequences(scaled_test, target_column, sequence_length)
@@ -141,13 +163,13 @@ val_dataset = StockDataset(val_seq, val_labels)
 test_dataset = StockDataset(test_seq, test_labels)
 
 # Create dataloaders
-batch_size = 1
+batch_size = 32
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
-val_loader = DataLoader(val_dataset, batch_size=batch_size)
-test_loader = DataLoader(test_dataset, batch_size=batch_size)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 #%%
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=100):
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, lr_scheduler = None):
     """
     Trains a PyTorch model and evaluates it on the validation set.
 
@@ -167,7 +189,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     val_loss_history = []
     mse_history = []
     rmse_history = []
+    
+
     for epoch in range(num_epochs):
+        print( optimizer.param_groups[0]["lr"])
         # Training phase
         model.train()
         train_loss = 0
@@ -198,6 +223,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 all_labels.extend(labels.tolist())
                 all_predictions.extend(outputs.flatten().tolist())
                 
+        # reduce learning rate based on schedular
+        if lr_scheduler:
+          lr_scheduler.step()
+          
         # Calculate average validation loss
         val_avg_loss = val_loss / len(val_loader)
         val_loss_history.append(val_avg_loss)
@@ -253,24 +282,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
 
 # Model parameters
 input_dim = len(features)
-hidden_dim = 64
+hidden_dim = 8
 num_layers = 2
 output_dim = 1
 
 # Initialize the model
 # model = StockPredictor(input_dim, hidden_dim, num_layers, output_dim)
-
-class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])
-        return out
- 
 
 class RNNModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
@@ -282,7 +299,19 @@ class RNNModel(nn.Module):
         out, _ = self.rnn(x)
         out = self.fc(out[:, -1, :])  # Take the output of the last time step
         return out
-    
+
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])
+        return out
+   
     
 class GRUModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
@@ -298,12 +327,12 @@ class GRUModel(nn.Module):
     
 # Model parameters
 input_dim = len(features)  # Number of input features
-hidden_dim = 64  # Number of hidden units
+hidden_dim = 8  # Number of hidden units
 output_dim = 1  # One output
 lr=0.0001
-epochs = 1
+epochs = 5
 criterion=nn.MSELoss()
-lstm_model = LSTMModel(input_dim, hidden_dim, num_layers, output_dim)
+lstm_model = LSTMModel(input_dim, hidden_dim, nu5_layers, output_dim)
 
 # Initialize the RNN model
 rnn_model = RNNModel(input_dim, hidden_dim, num_layers, output_dim)
@@ -311,15 +340,6 @@ rnn_model = RNNModel(input_dim, hidden_dim, num_layers, output_dim)
 # Initialize the GRU model
 gru_model = GRUModel(input_dim, hidden_dim, num_layers, output_dim)
 
-# Train LSTM model
-lstm_train_loss, lstm_val_loss, lstm_mse, lstm_rmse = train_model(
-    model=lstm_model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    criterion=criterion,
-    optimizer=torch.optim.Adam(lstm_model.parameters(), lr=lr),
-    num_epochs=epochs
-)
 
 # Train RNN model
 rnn_train_loss, rnn_val_loss, rnn_mse, rnn_rmse = train_model(
@@ -331,6 +351,16 @@ rnn_train_loss, rnn_val_loss, rnn_mse, rnn_rmse = train_model(
     num_epochs=epochs
 )
 
+
+# Train LSTM model
+lstm_train_loss, lstm_val_loss, lstm_mse, lstm_rmse = train_model(
+    model=lstm_model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    criterion=criterion,
+    optimizer=torch.optim.Adam(lstm_model.parameters(), lr=lr),
+    num_epochs=epochs
+)
 
 # Train GRU model
 gru_train_loss, gru_val_loss, gru_mse, gru_rmse = train_model(
@@ -358,7 +388,7 @@ print(f'GRU MSE: {gru_mse:.4f}, RMSE: {gru_rmse:.4f}')
 # We choose LSTM architecture since it had the lowest MSE
 
 
-num_layers = 5  # 5 layers
+num_layers = 3  # 5 layers
 
 ml_lstm_model = LSTMModel(input_dim, hidden_dim, num_layers, output_dim,)
 
@@ -389,9 +419,10 @@ class DropoutLSTMModel(nn.Module):
         x = self.fc(x[:, -1, :])
         return x
 
-num_layers = 5  # 5 layers
+num_layers = 3  # 5 layers
 dropout_rate = 0.3
-do_ml_lstm_model = DropoutLSTMModel(input_dim, hidden_dim, num_layers, output_dim=1 ,dropout_rate)
+output_dim = 1
+do_ml_lstm_model = DropoutLSTMModel(input_dim, hidden_dim, num_layers, output_dim ,dropout_rate)
 
 # Train ml lstm model
 do_ml_lstm_train_loss, do_ml_lstm_val_loss, do_ml_lstm_mse, do_ml_lstm_rmse = train_model(
@@ -420,7 +451,7 @@ def objective(params,scaled_train,scaled_val, features, target_column):
     # Model parameters
     input_dim = len(features)  # Number of input features
     output_dim = 1  # One output
-    ephocs = 10
+    epochs = 3
     
     # Prepare the sequences
     train_seq, train_labels = create_sequences(scaled_train, target_column, sequence_length)
@@ -439,36 +470,54 @@ def objective(params,scaled_train,scaled_val, features, target_column):
     
     # Define loss function and optimizer
     criterion = nn.MSELoss()
-    optimizer=torch.optim.Adam(do_ml_lstm_model.parameters(), lr=lr)
+    optimizer=torch.optim.Adam(model.parameters(), lr=lr)
 
-    # Train the model (simplified version)
-    for epoch in range(epochs):  # using a small number for demonstration
+    # Initialize variables to track the best validation loss and improvement threshold
+    best_val_loss = np.inf
+    loss_improvement_threshold = 0.1  # Change as needed, represents 1% improvement
+
+    for epoch in range(epochs):
         for sequences, labels in train_loader:
-            optimizer.zero_grad()
-            outputs = model(sequences)
-            outputs = outputs.squeeze(1) if outputs.size(1) == 1 else outputs.squeeze()
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+           optimizer.zero_grad()
+           outputs = model(sequences)
+           outputs = outputs.squeeze(1) if outputs.size(1) == 1 else outputs.squeeze()
+           loss = criterion(outputs, labels)
+           loss.backward()
+           optimizer.step()
 
-    # Evaluate the model
-    val_loss = 0
-    with torch.no_grad():
-        for sequences, labels in val_loader:
-            outputs = model(sequences)
-            outputs = outputs.squeeze(1) if outputs.size(1) == 1 else outputs.squeeze()
-            val_loss += criterion(outputs, labels).item()
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for sequences, labels in val_loader:
+                outputs = model(sequences)
+                outputs = outputs.squeeze(1) if outputs.size(1) == 1 else outputs.squeeze()
+                val_loss += criterion(outputs, labels).item()
 
-    return {'loss': val_loss, 'status': STATUS_OK}
+        # Calculate average validation loss
+        val_avg_loss = val_loss / len(val_loader)
+
+        # Early stopping condition for first 3 epochs
+        if epoch < 3:
+            improvement = (best_val_loss - val_avg_loss) / best_val_loss
+            if improvement < loss_improvement_threshold:
+                return {'loss': val_avg_loss, 'status': STATUS_FAIL}  # Skip this set of parameters
+
+        # Update best_val_loss
+        if val_avg_loss < best_val_loss:
+            best_val_loss = val_avg_loss
+
+    # Return the final average validation loss
+    return {'loss': best_val_loss, 'status': STATUS_OK}
 
 
 space = {
     'num_layers': hp.choice('num_layers', [2, 3, 4]),
-    'hidden_dim': hp.uniform('hidden_dim', 32, 256),
-    'learning_rate': hp.loguniform('learning_rate', -5, 0),  # e^-5 to e^0
+    'hidden_dim': hp.choice('hidden_dim', [4, 8, 16,32]),
+    'learning_rate': hp.loguniform('learning_rate', -5, -1),  # e^-5 to e^1
     'dropout_rate': hp.uniform('dropout_rate', 0, 0.5),
-    'batch_size': hp.choice('batch_size', [8, 16, 32, 64]),
-    'sequence_length': hp.choice('sequence_length', [30, 60, 90])  # Assuming fixed for now
+    'batch_size': hp.choice('batch_size', [16, 32, 64]),
+    'sequence_length': hp.choice('sequence_length', [10, 30, 60, 90])  # Assuming fixed for now
 }                      
                                    
 # Object to hold the history
@@ -486,19 +535,77 @@ best = fmin(
 print("Best: ", best)             
                                    
 #%%
-# Assuming 'test_loader' is your DataLoader for the test set
-model.eval()  # Set the model to evaluation mode
+# Extract the actual parameter values
+best_params = {
+    'num_layers': [2, 3, 4][best['num_layers']],
+    'hidden_dim': [4, 8, 16, 32][best['hidden_dim']],
+    'learning_rate': best['learning_rate'],  # No change needed, already a direct value
+    'dropout_rate': best['dropout_rate'],    # No change needed, already a direct value
+    'batch_size': [16, 32, 64][best['batch_size']],
+    'sequence_length': [10, 30, 60, 90][best['sequence_length']]
+}
 
+print("Best parameters: ", best_params)
+
+num_layers = int(best_params['num_layers'])
+hidden_dim = int(best_params['hidden_dim'])
+dropout_rate = best_params['dropout_rate']
+lr = best_params['learning_rate']
+batch_size = int(best_params['batch_size'])
+sequence_length =int(best_params['sequence_length'])
+epochs = 5 #train final_model for a longer ephochs
+
+train_seq, train_labels = create_sequences(scaled_train, target_column, sequence_length)
+val_seq, val_labels = create_sequences(scaled_val, target_column, sequence_length)
+test_seq, test_labels = create_sequences(scaled_test, target_column, sequence_length)
+
+# Create datasets
+train_dataset = StockDataset(train_seq, train_labels)
+val_dataset = StockDataset(val_seq, val_labels)
+test_dataset = StockDataset(test_seq, test_labels)
+
+# Create dataloaders
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+
+# Train with best parameters
+final_model = DropoutLSTMModel(input_dim, hidden_dim, num_layers, output_dim, dropout_rate)
+optimizer=torch.optim.Adam(final_model.parameters(), lr=lr)
+# Train ml lstm model
+final_loss, final_loss, final_mse, final_rmse = train_model(
+    model=final_model,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    criterion=criterion,
+    optimizer=optimizer,
+    num_epochs=epochs,  
+    lr_scheduler= optim.lr_scheduler.LinearLR(optimizer,start_factor=1.0,end_factor=0.5,total_iters=epochs)
+)
+final_mse = final_mse[-1]
+final_rmse = final_rmse[-1]
+print(f'Final model MSE: {final_mse:.4f}, RMSE: {final_rmse:.4f}')
+
+#%%%
 actuals = []
 predictions = []
 
+#plot loss and accuracy curve of final model
+final_model.eval()
 with torch.no_grad():
     for sequences, labels in test_loader:
-        outputs = model(sequences)
-        outputs = outputs.squeeze()  # Adjust the shape if necessary
+        outputs = final_model(sequences)
+        outputs = outputs.squeeze()
+        # Adjust the shape if necessary
         # scaler.inverse_transform(outputs)
+        #actuals.extend(labels)
+        #predictions.extend(outputs)
+        
         actuals.extend(target_scaler.inverse_transform(labels.reshape(1, -1)).flatten().tolist())
         predictions.extend(target_scaler.inverse_transform(outputs.reshape(1, -1)).flatten().tolist())
+
+mean_squared_error(actuals, predictions)
 
 # Plotting
 plt.figure(figsize=(10, 6))
@@ -511,27 +618,15 @@ plt.legend()
 plt.show()
 
 
-def convert_to_actual_prices(initial_price, percentage_changes):
-    actual_prices = [initial_price]
-    for change in percentage_changes:
-        new_price = actual_prices[-1] * (1 + change / 100)
-        actual_prices.append(new_price)
-    return actual_prices
 
-initial_closing_price = test_data['Close'][sequence_length-1]  # The closing price at the start of your percentage change series
-actual_percentage_changes =  actuals # Your series of percentage changes
-predicted_percentage_changes = predictions
-
-
-actual_closing_prices = convert_to_actual_prices(initial_closing_price, actual_percentage_changes)
-
-predicted_closing_prices = convert_to_actual_prices(initial_closing_price, predicted_percentage_changes)
-
+plot_df = pd.DataFrame(test_data['Close'][sequence_length:], index = test_data[sequence_length:].index)
+plot_df['pred_PCR'] = predictions
+plot_df['Predicted_Close'] = np.log(plot_df[ 'Close']).shift(1) * (1 + np.exp(plot_df['pred_PCR']) / 100)
 
 # Plotting
 plt.figure(figsize=(10, 6))
-plt.plot(actual_closing_prices, label='Actual')
-plt.plot(predicted_closing_prices, label='Predicted', alpha=0.7)
+plt.plot(plot_df['Predicted_Close'], label='Actual')
+plt.plot(plot_df['Predicted_Close'], label='Predicted', alpha=0.7)
 plt.title('Actual vs Predicted Closing Values')
 plt.xlabel('Samples')
 plt.ylabel('PCR Value')
