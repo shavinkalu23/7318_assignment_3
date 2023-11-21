@@ -621,7 +621,7 @@ plt.show()
 
 plot_df = pd.DataFrame(test_data['Close'][sequence_length:], index = test_data[sequence_length:].index)
 plot_df['pred_PCR'] = predictions
-plot_df['Predicted_Close'] = np.log(plot_df[ 'Close']).shift(1) * (1 + np.exp(plot_df['pred_PCR']) / 100)
+plot_df['Predicted_Close'] = plot_df['Close'].shift(1) ** (1 +(plot_df['pred_PCR'] / 100))
 
 # Plotting
 plt.figure(figsize=(10, 6))
