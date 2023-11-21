@@ -625,7 +625,7 @@ plot_df['Predicted_Close'] = plot_df['Close'].shift(1) ** (1 +(plot_df['pred_PCR
 
 # Plotting
 plt.figure(figsize=(10, 6))
-plt.plot(plot_df['Predicted_Close'], label='Actual')
+plt.plot(plot_df['Close'], label='Actual')
 plt.plot(plot_df['Predicted_Close'], label='Predicted', alpha=0.7)
 plt.title('Actual vs Predicted Closing Values')
 plt.xlabel('Samples')
